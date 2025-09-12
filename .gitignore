@@ -16,3 +16,7 @@ dist/
 
 # Ignore vscode directory
 .vscode/
+
+# Ignore output directories and results
+ade20k_outputs/
+ade20k_results/
