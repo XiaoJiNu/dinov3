@@ -162,23 +162,26 @@ class SSLMetaArch(nn.Module):
                 ),
             )
 
-        # Gram
-        self.gram_use_loss = self.cfg.gram.use_loss
-        self.gram_ema_teacher = False
-        self.has_gram_teacher = False
-        self.gram_teacher_initialized = False
+        # Gram锚定机制 - DINOv3的核心创新
+        # 用于解决大规模SSL训练中的密集特征退化问题
+        self.gram_use_loss = self.cfg.gram.use_loss  # 是否启用Gram损失
+        self.gram_ema_teacher = False  # 是否使用EMA教师作为Gram教师
+        self.has_gram_teacher = False  # 是否有独立的Gram教师模型
+        self.gram_teacher_initialized = False  # Gram教师是否已初始化
         if self.gram_use_loss:
-            # Gram regularization
+            # Gram正则化损失：约束特征间的相对相似性结构而非特征本身
             self.gram_loss = GramLoss(
-                apply_norm=self.cfg.gram.normalized,
-                remove_only_teacher_neg=self.cfg.gram.remove_only_teacher_neg,
-                remove_neg=self.cfg.gram.remove_neg,
+                apply_norm=self.cfg.gram.normalized,  # 是否对特征进行L2归一化
+                remove_only_teacher_neg=self.cfg.gram.remove_only_teacher_neg,  # 是否只移除教师负值
+                remove_neg=self.cfg.gram.remove_neg,  # 是否移除所有负相似度
             )
-            # Construct gram teacher
+            # 构建Gram教师模型
+            # Gram教师通常是模型训练早期（密集特征质量最佳时）的检查点
             self.has_gram_teacher = True if not cfg.gram.ema_teacher else False
             if self.has_gram_teacher:
+                # 创建独立的Gram教师模型，用于提供高质量的特征相似性结构
                 self.gram_teacher = nn.ModuleDict(gram_model_dict)
-                self.gram_teacher.requires_grad_(False)
+                self.gram_teacher.requires_grad_(False)  # Gram教师不需要梯度更新
                 logger.info(f"Gram teacher parameter at init: {next(self.gram_teacher.named_parameters())}")
             else:
                 self.gram_teacher = None
@@ -469,48 +472,65 @@ class SSLMetaArch(nn.Module):
         }
 
     def get_gram_teacher_output(self, images, *, masks, teacher_global, student_global, student_global_crops_size):
-        # Get student patch features
+        """
+        获取Gram教师的输出特征，用于计算Gram锚定损失
+        
+        Gram锚定的核心思想：不直接约束特征向量，而是约束特征间的相对相似性结构。
+        这允许特征继续演化学习高级语义，同时保持良好的空间一致性。
+        """
+        # 获取学生模型的补丁特征
         student_patches = student_global["patch_pre_head"].flatten(0, 1)  # [n_crops * B, P, D]
 
-        # Get gram targets
+        # 获取Gram目标特征（高质量的参考特征）
         if self.gram_ema_teacher:
+            # 使用EMA教师的特征作为Gram目标
             teacher_patches = teacher_global["patch_pre_head"].flatten(0, 1)  # [n_crops * B, P, D]
         else:
+            # 使用独立的Gram教师模型（通常是训练早期的高质量检查点）
             if not self.gram_teacher_initialized:
                 raise ValueError("Gram teacher has not been initialized. Load a checkpoint or from the EMA teacher.")
             n_crops, B, rgb, H, W = images.shape
             images = images.flatten(0, 1)  # [n_crops * B, rgb, H, W]
 
             with torch.no_grad():
+                # 前向传播获取Gram教师的特征，不计算梯度
                 backbone_out = self.gram_teacher.backbone(images, is_training=True)
             teacher_patches = backbone_out["x_norm_patchtokens"]  # [n_crops * B, P_T, D]
 
-            # Downsample Gram teacher features if needed
+            # 如果需要，对Gram教师特征进行下采样以匹配学生特征的尺寸
+            # 这是"高分辨率Gram锚定"的实现：使用更高分辨率的教师特征
             if teacher_patches.shape[1] != student_patches.shape[1]:
-                N = H // self.cfg.student.patch_size
+                N = H // self.cfg.student.patch_size  # 教师特征的空间尺寸
                 assert teacher_patches.shape[1] == N**2
-                N_student = student_global_crops_size // self.cfg.student.patch_size
+                N_student = student_global_crops_size // self.cfg.student.patch_size  # 学生特征的空间尺寸
                 assert student_patches.shape[1] == N_student**2
+                
+                # 将特征重新排列为空间格式进行插值
                 patches_hw = teacher_patches.transpose(-2, -1).unflatten(-1, (N, N))  # [n_crops * B, D, N, N]
+                # 下采样到学生特征的分辨率
                 patches_hw = torch.nn.functional.interpolate(
                     patches_hw,
                     size=(N_student, N_student),
-                    mode=self.gram_global_teacher_resize_method,
+                    mode=self.gram_global_teacher_resize_method,  # 插值方法
                     align_corners=False,
-                    antialias=self.gram_global_teacher_resize_antialias,
+                    antialias=self.gram_global_teacher_resize_antialias,  # 抗锯齿
                 )
+                # 重新展平为补丁格式
                 teacher_patches = patches_hw.flatten(-2, -1).transpose(
                     -2, -1
                 )  # [n_crops * B, N_student * N_student, D]
                 assert teacher_patches.shape == student_patches.shape
 
-        # Select the patches to be considered in the loss
-        orig_student_patches = student_patches
+        # 选择要在损失中考虑的补丁
+        # 根据配置，可以只使用masked、unmasked或所有补丁
+        orig_student_patches = student_patches  # 保存原始特征用于统计
         orig_teacher_patches = teacher_patches
         if self.gram_tokens_used == "masked":
+            # 只使用被掩码的补丁计算Gram损失
             student_patches = student_patches[masks]
             teacher_patches = teacher_patches[masks]
         elif self.gram_tokens_used == "unmasked":
+            # 只使用未被掩码的补丁计算Gram损失
             student_patches = student_patches[~masks]
             teacher_patches = teacher_patches[~masks]
 
@@ -643,12 +663,14 @@ class SSLMetaArch(nn.Module):
         loss_dict["ibot_loss"] = ibot_patch_loss
         loss_accumulator += self.ibot_loss_weight * ibot_patch_loss
 
-        # Gram loss
+        # Gram锚定损失 - DINOv3的核心创新
         if self.gram_use_loss:
+            # 计算学生特征与Gram教师特征之间的Gram矩阵损失
+            # 这个损失约束特征间的相对相似性结构，防止密集特征退化
             gram_loss = self.gram_loss(
-                gram_global["student_patches"],
-                gram_global["teacher_patches"],
-                img_level=self.gram_img_level,
+                gram_global["student_patches"],  # 学生模型的补丁特征
+                gram_global["teacher_patches"],  # Gram教师的补丁特征
+                img_level=self.gram_img_level,   # 是否在图像级别计算
             )
 
             if self.gram_loss_schedule is not None:
@@ -680,7 +702,14 @@ class SSLMetaArch(nn.Module):
 
     @torch.no_grad()
     def gram_load_ema_teacher(self):
+        """
+        从EMA教师模型加载权重到Gram教师模型
+        
+        这通常在训练的特定迭代点执行，将当前的高质量EMA教师
+        作为Gram教师的"锚点"，用于后续的特征结构约束。
+        """
         if self.has_gram_teacher:
+            # 跳过头部层，只加载骨干网络的权重
             skip_load_prefixes = ["dino_head.", "ibot_head."]
             self.gram_teacher.load_state_dict(
                 {
@@ -689,9 +718,9 @@ class SSLMetaArch(nn.Module):
                     if not any(k.startswith(prefix) for prefix in skip_load_prefixes)
                 }
             )
-            self.gram_teacher.requires_grad_(False)
-            self.gram_teacher.eval()
-            self.gram_teacher_initialized = True
+            self.gram_teacher.requires_grad_(False)  # 冻结Gram教师参数
+            self.gram_teacher.eval()  # 设为评估模式
+            self.gram_teacher_initialized = True  # 标记为已初始化
 
     def train(self):
         super().train()
@@ -721,9 +750,20 @@ class SSLMetaArch(nn.Module):
             torch._foreach_add_(teacher_param_list, student_param_list, alpha=1 - m)
 
     def update_gram(self, m=0):
+        """
+        更新Gram教师模型的参数
+        
+        这个函数支持定期更新Gram教师，以保持其作为"高质量锚点"的有效性。
+        更新频率由配置中的gram_update_frequency控制。
+        
+        Args:
+            m: 动量系数，m=0表示完全替换，m>0表示平滑更新
+        """
         if not self.has_gram_teacher:
             return
         logger.info("Updating gram teacher with teacher weights.")
+        
+        # 初始化参数列表（只在第一次调用时执行）
         if self.gram_params_lists is None:
             teacher_param_list = []
             gramteacher_param_list = []
@@ -735,9 +775,11 @@ class SSLMetaArch(nn.Module):
         else:
             gramteacher_param_list, teacher_param_list = self.gram_params_lists
 
+        # 使用动量更新Gram教师参数
+        # gram_teacher = m * gram_teacher + (1-m) * teacher
         with torch.no_grad():
-            torch._foreach_mul_(gramteacher_param_list, m)
-            torch._foreach_add_(gramteacher_param_list, teacher_param_list, alpha=1 - m)
+            torch._foreach_mul_(gramteacher_param_list, m)  # 缩放当前Gram教师参数
+            torch._foreach_add_(gramteacher_param_list, teacher_param_list, alpha=1 - m)  # 加入教师参数
 
     def build_data_augmentation_dino(self, cfg):
         return DataAugmentationDINO(
